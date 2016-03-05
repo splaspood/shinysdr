@@ -96,6 +96,48 @@ _aprs_squelch_type = Enum({
     u'ctcss': 'Voice Alert',
     u'monitor': u'Monitor'}, strict=True)
 
+class POCSAGDemodulator(gr.hier_block2, ExportedState):
+    '''
+    Demod and parse POCSAG.
+    '''
+    def __init__(self, context):
+        gr.hier_block2.__init__(
+            self, self.__class__.__name__,
+            gr.io_signature(1, 1, gr.sizeof_float * 1),
+            gr.io_signature(1, 1, gr.sizeof_float * 1),
+        )
+        
+        def receive(line):
+            # %r here provides robustness against arbitrary bytes.
+            log.msg(u'POCSAG: %r' % (line,))
+            message = parse_tnc2(line, time.time())
+            log.msg(u'   -> %s' % (message,))
+            context.output_message(message)
+        
+        self.__mm_demod = MultimonNGDemodulator(
+            multimon_demod_args=['-a', 'POCSAG1200', '-a', 'POCSAG512'],
+            protocol=POCSAGProcessProtocol(receive),
+            context=context)
+        
+        self.__router = blocks.multiply_matrix_ff([[0, 0]])
+        
+        self.connect(
+            self,
+            self.__mm_demod,
+            self.__router,
+            self)
+        self.connect(self.__mm_demod, (self.__router, 1))
+    
+    def get_input_type(self):
+        return self.__mm_demod.get_input_type()
+    
+    def get_output_type(self):
+        return self.__mm_demod.get_output_type()
+    
+    @exported_value(type=_aprs_squelch_type)
+    def get_squelch(self):
+        return self.__squelch_mode
+    
 
 class APRSDemodulator(gr.hier_block2, ExportedState):
     '''
@@ -220,6 +262,38 @@ class FMAPRSDemodulator(gr.hier_block2, ExportedState):
     def get_band_filter_shape(self):
         return self.fm_demod.get_band_filter_shape()
 
+class POCSAGProcessProtocol(ProcessProtocol):
+    def __init__(self, target):
+        self.__target = target
+        self.__line_receiver = LineReceiver()
+        self.__line_receiver.delimiter = '\n'
+        self.__line_receiver.lineReceived = self.__lineReceived
+        self.__last_line = None
+    
+    def outReceived(self, data):
+        # split lines
+        self.__line_receiver.dataReceived(data)
+        
+    def errReceived(self, data):
+        # we should inherit stderr, not pipe it
+        raise Exception('shouldn\'t happen')
+    
+    def __lineReceived(self, line):
+        if line == '':  # observed glitch in output
+            pass
+        elif line.startswith('Enabled demodulators:'):
+            pass
+        elif line.startswith('$ULTW') and self.__last_line is not None:  # observed glitch in output; need to glue to previous line, I think?
+            ll = self.__last_line
+            self.__last_line = None
+            self.__target(ll + line)
+        elif line.startswith('APRS: '):
+            line = line[len('APRS: '):]
+            self.__last_line = line
+            self.__target(line)
+        else:
+            # TODO: Log these properly
+            print 'Not APRS line: %r' % line
 
 class APRSProcessProtocol(ProcessProtocol):
     def __init__(self, target):
@@ -254,13 +328,71 @@ class APRSProcessProtocol(ProcessProtocol):
             # TODO: Log these properly
             print 'Not APRS line: %r' % line
 
+# TODO: Eliminate this class and replace it with adapters available to any demodulator
+class FMPOCSAGDemodulator(gr.hier_block2, ExportedState):
+    implements(IDemodulator)
+    
+    def __init__(self, mode, input_rate=0, context=None):
+        assert input_rate > 0
+        assert context is not None
+        gr.hier_block2.__init__(
+            self, str(mode) + ' (FM + Multimon-NG) demodulator',
+            gr.io_signature(1, 1, gr.sizeof_gr_complex * 1),
+            gr.io_signature(1, 1, gr.sizeof_float * 1),
+        )
+        self.mode = mode
+        self.input_rate = input_rate
+        
+        # FM demod
+        # TODO: Retry telling the NFMDemodulator to have its output rate be pipe_rate instead of using a resampler. Something went wrong when trying that before. Same thing is done in dsd.py
+        self.fm_demod = NFMDemodulator(
+            mode='NFM',
+            input_rate=input_rate,
+            no_audio_filter=True,  # don't remove CTCSS tone
+            tau=None)  # no deemphasis
+        assert self.fm_demod.get_output_type().get_kind() == 'MONO'
+        fm_audio_rate = self.fm_demod.get_output_type().get_sample_rate()
+        
+        # Subprocess
+        self.mm_demod = POCSAGDemodulator(context=context)
+        mm_audio_rate = self.mm_demod.get_input_type().get_sample_rate()
+        
+        # Output
+        self.connect(
+            self,
+            self.fm_demod,
+            make_resampler(fm_audio_rate, mm_audio_rate),
+            self.mm_demod,
+            self)
+    
+    def can_set_mode(self, mode):
+        return False
+    
+    def get_half_bandwidth(self):
+        return self.fm_demod.get_half_bandwidth()
+    
+    def get_output_type(self):
+        return self.mm_demod.get_output_type()
+    
+    @exported_block()
+    def get_mm_demod(self):
+        return self.mm_demod
+    
+    @exported_value()
+    def get_band_filter_shape(self):
+        return self.fm_demod.get_band_filter_shape()
 
 # TODO: Arrange for a way for the user to see why it is unavailable.
 _multimon_available = test_subprocess('multimon-ng -h; exit 0', 'available demodulators:', shell=True)
-
 
 pluginDef_APRS = ModeDef(
     mode='APRS',  # TODO: Rename mode to be more accurate
     label='APRS',
     demod_class=FMAPRSDemodulator,
+    available=_multimon_available)
+
+pluginDef_POCSAG = ModeDef(
+    mode='POCSAG',  # TODO: Rename mode to be more accurate
+    label='POCSAG',
+    demod_class=FMPOCSAGDemodulator,
     available=_multimon_available)
